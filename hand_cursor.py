@@ -30,7 +30,10 @@ import numpy as np
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 
-SMOOTH_WINDOW_SEC = 0.5  # Rolling average window in seconds for cursor smoothing
+SMOOTH_MIN_SEC  = 0.08   # Smoothing window when moving fast (responsive)
+SMOOTH_MAX_SEC  = 0.55   # Smoothing window when nearly still (most smoothing)
+VELOCITY_SCALE  = 800    # px/s that maps to the minimum window
+DEAD_ZONE_PX    = 6      # Cursor won't move unless hand moved more than this many px
 PINCH_THRESHOLD = 0.06   # Normalised dist(thumb_tip, index_tip) for left-click
 FIST_THRESHOLD  = 0.13   # Normalised avg dist(fingertips, palm) for right-click
 GESTURE_FRAMES  = 2      # Consecutive frames a gesture must hold before activating
@@ -136,6 +139,7 @@ def fist_dist(lm) -> float:
     return float(np.mean(dists))
 
 
+
 # ── HUD drawing ───────────────────────────────────────────────────────────────
 
 # Landmark indices that get highlighted per gesture
@@ -209,6 +213,15 @@ def main() -> None:
     # Rolling position buffer: deque of (timestamp, screen_x, screen_y)
     pos_buf: collections.deque = collections.deque()
 
+    # Dead zone: last position actually sent to the OS
+    last_sent_x: float = SCREEN_W / 2
+    last_sent_y: float = SCREEN_H / 2
+
+    # Velocity tracking for adaptive smoothing
+    prev_raw_x: float = SCREEN_W / 2
+    prev_raw_y: float = SCREEN_H / 2
+    prev_raw_t: float = 0.0
+
     # Button hold state
     left_held:  bool = False
     right_held: bool = False
@@ -240,20 +253,38 @@ def main() -> None:
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
 
-                # ── Cursor movement (palm centre → screen, rolling average) ──
+                # ── Cursor movement (palm centre → screen) ────────────────
                 raw_x = float(np.mean([lm[i].x for i in IDX_PALM])) * SCREEN_W
                 raw_y = float(np.mean([lm[i].y for i in IDX_PALM])) * SCREEN_H
-
                 now_t = time.monotonic()
+
+                # Adaptive window: shrinks when moving fast, grows when still
+                if prev_raw_t > 0:
+                    dt = now_t - prev_raw_t
+                    vel = (np.sqrt((raw_x - prev_raw_x) ** 2 +
+                                   (raw_y - prev_raw_y) ** 2) / dt
+                           if dt > 0 else 0.0)
+                else:
+                    vel = 0.0
+                t = float(np.clip(vel / VELOCITY_SCALE, 0.0, 1.0))
+                window = SMOOTH_MAX_SEC - t * (SMOOTH_MAX_SEC - SMOOTH_MIN_SEC)
+                prev_raw_x, prev_raw_y, prev_raw_t = raw_x, raw_y, now_t
+
                 pos_buf.append((now_t, raw_x, raw_y))
-                cutoff = now_t - SMOOTH_WINDOW_SEC
+                cutoff = now_t - window
                 while pos_buf and pos_buf[0][0] < cutoff:
                     pos_buf.popleft()
 
                 smooth_x = float(np.mean([p[1] for p in pos_buf]))
                 smooth_y = float(np.mean([p[2] for p in pos_buf]))
-                move_cursor(int(np.clip(smooth_x, 0, SCREEN_W - 1)),
-                            int(np.clip(smooth_y, 0, SCREEN_H - 1)))
+
+                # Dead zone: only send a new position if we've moved enough
+                ddx = smooth_x - last_sent_x
+                ddy = smooth_y - last_sent_y
+                if np.sqrt(ddx * ddx + ddy * ddy) > DEAD_ZONE_PX:
+                    move_cursor(int(np.clip(smooth_x, 0, SCREEN_W - 1)),
+                                int(np.clip(smooth_y, 0, SCREEN_H - 1)))
+                    last_sent_x, last_sent_y = smooth_x, smooth_y
 
                 # ── Gesture classification ─────────────────────────────────
                 pd = pinch_dist(lm)
